@@ -9,7 +9,9 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -92,11 +94,18 @@ func TestTransportCreatesSpanRecordsTraceAndEndsOnBodyClose(t *testing.T) {
 
 		clientTrace.DNSStart(httptrace.DNSStartInfo{Host: "example.com"})
 		clientTrace.DNSDone(httptrace.DNSDoneInfo{Addrs: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}})
+		clientTrace.GetConn("example.com:8080")
 		clientTrace.ConnectStart("tcp", "example.com:8080")
 		clientTrace.ConnectDone("tcp", "example.com:8080", nil)
 		clientTrace.TLSHandshakeStart()
 		clientTrace.TLSHandshakeDone(tls.ConnectionState{Version: tls.VersionTLS13}, nil)
 		clientTrace.GotConn(httptrace.GotConnInfo{Reused: true, WasIdle: true, IdleTime: 5})
+		clientTrace.WroteHeaders()
+		clientTrace.Wait100Continue()
+		clientTrace.Got100Continue()
+		if err := clientTrace.Got1xxResponse(103, nil); err != nil {
+			t.Fatal(err)
+		}
 		clientTrace.WroteRequest(httptrace.WroteRequestInfo{})
 		clientTrace.GotFirstResponseByte()
 		clientTrace.PutIdleConn(nil)
@@ -149,6 +158,7 @@ func TestTransportCreatesSpanRecordsTraceAndEndsOnBodyClose(t *testing.T) {
 
 	for _, key := range []string{
 		"httptrace.dns.duration_ns",
+		"httptrace.get_conn.duration_ns",
 		"httptrace.connect.duration_ns",
 		"httptrace.tls_handshake.duration_ns",
 		"httptrace.time_to_first_byte_ns",
@@ -161,17 +171,201 @@ func TestTransportCreatesSpanRecordsTraceAndEndsOnBodyClose(t *testing.T) {
 	for _, name := range []string{
 		"httptrace.dns_start",
 		"httptrace.dns",
+		"httptrace.get_conn_start",
 		"httptrace.connect_start",
 		"httptrace.connect",
 		"httptrace.tls_handshake_start",
 		"httptrace.tls_handshake",
 		"httptrace.got_conn",
+		"httptrace.wrote_headers",
+		"httptrace.wait_100_continue",
+		"httptrace.got_100_continue",
+		"httptrace.got_1xx_response",
 		"httptrace.wrote_request",
 		"httptrace.got_first_response_byte",
 		"httptrace.put_idle_conn",
 	} {
 		if !span.hasEvent(name) {
 			t.Fatalf("missing event %q", name)
+		}
+	}
+}
+
+func TestTraceRecorderMatchesConcurrentDNSAndConnectDurationsByTarget(t *testing.T) {
+	span := newRecordingSpan("trace")
+	clock := steppedClock(
+		time.Unix(0, 0),
+		10*time.Millisecond,
+		20*time.Millisecond,
+		50*time.Millisecond,
+		80*time.Millisecond,
+		90*time.Millisecond,
+		100*time.Millisecond,
+		150*time.Millisecond,
+		180*time.Millisecond,
+	)
+	recorder := newTraceRecorderWithClock(span, clock)
+
+	recorder.markDNSStart("a.example.com")
+	recorder.markDNSStart("b.example.com")
+	recorder.markDNSDone(httptrace.DNSDoneInfo{
+		Addrs: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}},
+	})
+	recorder.markDNSDone(httptrace.DNSDoneInfo{
+		Addrs: []net.IPAddr{{IP: net.ParseIP("127.0.0.2")}},
+	})
+
+	recorder.markConnectStart("tcp", "127.0.0.1:443")
+	recorder.markConnectStart("tcp", "[::1]:443")
+	recorder.markConnectDone("tcp", "127.0.0.1:443", nil)
+	recorder.markConnectDone("tcp", "[::1]:443", nil)
+
+	events := span.eventsByName("httptrace.dns")
+	if len(events) != 2 {
+		t.Fatalf("dns events = %d, want 2", len(events))
+	}
+	assertAttr(t, attrMap(events[0].attrs), "httptrace.dns.duration_ns", int64(40*time.Millisecond))
+	assertAttr(t, attrMap(events[1].attrs), "httptrace.dns.duration_ns", int64(60*time.Millisecond))
+
+	events = span.eventsByName("httptrace.connect")
+	if len(events) != 2 {
+		t.Fatalf("connect events = %d, want 2", len(events))
+	}
+	assertAttr(t, attrMap(events[0].attrs), "network.peer.address", "127.0.0.1")
+	assertAttr(t, attrMap(events[0].attrs), "httptrace.connect.duration_ns", int64(60*time.Millisecond))
+	assertAttr(t, attrMap(events[1].attrs), "network.peer.address", "::1")
+	assertAttr(t, attrMap(events[1].attrs), "httptrace.connect.duration_ns", int64(80*time.Millisecond))
+}
+
+func TestTraceRecorderMatchesManyConnectDurationsOutOfOrder(t *testing.T) {
+	span := newRecordingSpan("trace")
+	clock := steppedClock(
+		time.Unix(0, 0),
+		10*time.Millisecond,
+		20*time.Millisecond,
+		30*time.Millisecond,
+		40*time.Millisecond,
+		100*time.Millisecond,
+		130*time.Millisecond,
+		180*time.Millisecond,
+		220*time.Millisecond,
+	)
+	recorder := newTraceRecorderWithClock(span, clock)
+
+	recorder.markConnectStart("tcp", "10.0.0.1:443")
+	recorder.markConnectStart("tcp", "10.0.0.2:443")
+	recorder.markConnectStart("tcp", "[::1]:443")
+	recorder.markConnectStart("tcp", "example.com:443")
+
+	recorder.markConnectDone("tcp", "[::1]:443", nil)
+	recorder.markConnectDone("tcp", "10.0.0.1:443", nil)
+	recorder.markConnectDone("tcp", "example.com:443", nil)
+	recorder.markConnectDone("tcp", "10.0.0.2:443", nil)
+
+	want := map[string]int64{
+		"10.0.0.1":    int64(120 * time.Millisecond),
+		"10.0.0.2":    int64(200 * time.Millisecond),
+		"::1":         int64(70 * time.Millisecond),
+		"example.com": int64(140 * time.Millisecond),
+	}
+
+	events := span.eventsByName("httptrace.connect")
+	if len(events) != len(want) {
+		t.Fatalf("connect events = %d, want %d", len(events), len(want))
+	}
+	for _, event := range events {
+		attrs := attrMap(event.attrs)
+		host, ok := attrs["network.peer.address"].(string)
+		if !ok {
+			t.Fatalf("connect event attrs missing network.peer.address: %v", attrs)
+		}
+		assertAttr(t, attrs, "httptrace.connect.duration_ns", want[host])
+		delete(want, host)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing connect events for hosts: %v", want)
+	}
+}
+
+func TestClientTraceCallbacksCanRunConcurrently(t *testing.T) {
+	const attempts = 64
+
+	span := newRecordingSpan("trace")
+	clientTrace := newTraceRecorder(span).clientTrace()
+
+	runConcurrent := func(fn func(int)) {
+		t.Helper()
+
+		var wg sync.WaitGroup
+		for i := 0; i < attempts; i++ {
+			i := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				fn(i)
+			}()
+		}
+		wg.Wait()
+	}
+
+	runConcurrent(func(i int) {
+		clientTrace.DNSStart(httptrace.DNSStartInfo{Host: connectTestAddr(i)})
+	})
+	runConcurrent(func(i int) {
+		clientTrace.DNSDone(httptrace.DNSDoneInfo{
+			Addrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, byte(i+1))}},
+		})
+	})
+
+	runConcurrent(func(i int) {
+		clientTrace.GetConn(connectTestAddr(i))
+	})
+	runConcurrent(func(i int) {
+		clientTrace.ConnectStart("tcp", connectTestAddr(i))
+	})
+	runConcurrent(func(i int) {
+		clientTrace.ConnectDone("tcp", connectTestAddr(i), nil)
+	})
+	runConcurrent(func(i int) {
+		clientTrace.GotConn(httptrace.GotConnInfo{
+			Conn: stubConn{remote: &net.TCPAddr{IP: net.IPv4(10, 0, 0, byte(i+1)), Port: 443}},
+		})
+	})
+
+	runConcurrent(func(int) {
+		clientTrace.WroteHeaders()
+		clientTrace.Wait100Continue()
+		clientTrace.Got100Continue()
+		if err := clientTrace.Got1xxResponse(http.StatusEarlyHints, nil); err != nil {
+			t.Errorf("Got1xxResponse error = %v", err)
+		}
+		clientTrace.WroteRequest(httptrace.WroteRequestInfo{})
+		clientTrace.GotFirstResponseByte()
+		clientTrace.PutIdleConn(nil)
+	})
+
+	assertEventCount(t, span, "httptrace.dns_start", attempts)
+	assertEventCount(t, span, "httptrace.dns", attempts)
+	assertEventCount(t, span, "httptrace.get_conn_start", attempts)
+	assertEventCount(t, span, "httptrace.connect_start", attempts)
+	assertEventCount(t, span, "httptrace.connect", attempts)
+	assertEventCount(t, span, "httptrace.got_conn", attempts)
+	assertEventCount(t, span, "httptrace.wrote_headers", attempts)
+	assertEventCount(t, span, "httptrace.wait_100_continue", attempts)
+	assertEventCount(t, span, "httptrace.got_100_continue", attempts)
+	assertEventCount(t, span, "httptrace.got_1xx_response", attempts)
+	assertEventCount(t, span, "httptrace.wrote_request", attempts)
+	assertEventCount(t, span, "httptrace.got_first_response_byte", attempts)
+	assertEventCount(t, span, "httptrace.put_idle_conn", attempts)
+
+	for _, event := range span.eventsByName("httptrace.connect") {
+		if _, ok := attrMap(event.attrs)["httptrace.connect.duration_ns"]; !ok {
+			t.Fatalf("connect event missing duration: %v", event.attrs)
+		}
+	}
+	for _, event := range span.eventsByName("httptrace.dns") {
+		if _, ok := attrMap(event.attrs)["httptrace.dns.duration_ns"]; !ok {
+			t.Fatalf("dns event missing duration: %v", event.attrs)
 		}
 	}
 }
@@ -468,6 +662,13 @@ func TestRequestPortAndAttributes(t *testing.T) {
 	assertAttr(t, attrs, "url.scheme", "https")
 	assertAttr(t, attrs, "server.address", "example.com")
 	assertAttr(t, attrs, "server.port", int64(9443))
+
+	reqWithUserinfo := mustRequest(t, http.MethodGet, "https://user:secret@example.com/private?q=1")
+	attrs = attrMap(requestAttributes(reqWithUserinfo, nil))
+	assertAttr(t, attrs, "url.full", "https://user:xxxxx@example.com/private?q=1")
+	if got := reqWithUserinfo.URL.User.String(); got != "user:secret" {
+		t.Fatalf("request URL userinfo = %q, want original userinfo", got)
+	}
 }
 
 func TestDefaultSpanNameFallsBackToURLHost(t *testing.T) {

@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ var clientSpanStartOption = trace.WithSpanKind(trace.SpanKindClient)
 
 const (
 	dnsDurationKey             = attribute.Key("httptrace.dns.duration_ns")
+	getConnDurationKey         = attribute.Key("httptrace.get_conn.duration_ns")
 	connectDurationKey         = attribute.Key("httptrace.connect.duration_ns")
 	tlsHandshakeDurationKey    = attribute.Key("httptrace.tls_handshake.duration_ns")
 	timeToFirstByteKey         = attribute.Key("httptrace.time_to_first_byte_ns")
@@ -148,17 +151,29 @@ func isNoopTracerProvider(provider trace.TracerProvider) bool {
 
 type traceRecorder struct {
 	span trace.Span
+	now  func() time.Time
 
-	startNS        int64
-	dnsStartNS     atomic.Int64
-	connectStartNS atomic.Int64
-	tlsStartNS     atomic.Int64
+	startNS    int64
+	mu         sync.Mutex
+	dnsStarts  []int64
+	getConn    []int64
+	connectMap map[string]int64
+	tlsStartNS atomic.Int64
 }
 
 func newTraceRecorder(span trace.Span) *traceRecorder {
+	return newTraceRecorderWithClock(span, time.Now)
+}
+
+func newTraceRecorderWithClock(span trace.Span, now func() time.Time) *traceRecorder {
+	if now == nil {
+		now = time.Now
+	}
 	return &traceRecorder{
-		span:    span,
-		startNS: time.Now().UnixNano(),
+		span:       span,
+		now:        now,
+		startNS:    now().UnixNano(),
+		connectMap: make(map[string]int64),
 	}
 }
 
@@ -174,6 +189,9 @@ func NewClientTrace(ctx context.Context) *httptrace.ClientTrace {
 
 func (r *traceRecorder) clientTrace() *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			r.markGetConnStart(hostPort)
+		},
 		DNSStart: func(info httptrace.DNSStartInfo) {
 			r.markDNSStart(info.Host)
 		},
@@ -195,6 +213,18 @@ func (r *traceRecorder) clientTrace() *httptrace.ClientTrace {
 		GotConn: func(info httptrace.GotConnInfo) {
 			r.markGotConn(info)
 		},
+		WroteHeaders: func() {
+			r.markWroteHeaders()
+		},
+		Wait100Continue: func() {
+			r.markWait100Continue()
+		},
+		Got100Continue: func() {
+			r.markGot100Continue()
+		},
+		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+			return r.markGot1xxResponse(code, header)
+		},
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
 			r.markWroteRequest(info.Err)
 		},
@@ -208,8 +238,10 @@ func (r *traceRecorder) clientTrace() *httptrace.ClientTrace {
 }
 
 func (r *traceRecorder) markDNSStart(host string) {
-	now := time.Now()
-	r.dnsStartNS.Store(now.UnixNano())
+	now := r.now()
+	r.mu.Lock()
+	r.dnsStarts = append(r.dnsStarts, now.UnixNano())
+	r.mu.Unlock()
 
 	r.span.AddEvent("httptrace.dns_start",
 		trace.WithTimestamp(now),
@@ -219,9 +251,9 @@ func (r *traceRecorder) markDNSStart(host string) {
 
 func (r *traceRecorder) markDNSDone(info httptrace.DNSDoneInfo) {
 	var attrs []attribute.KeyValue
-	now := time.Now()
+	now := r.now()
 
-	if startNS := r.dnsStartNS.Load(); startNS != 0 {
+	if startNS := r.popDNSStart(); startNS != 0 {
 		duration := now.Sub(time.Unix(0, startNS))
 		attrs = append(attrs, dnsDurationKey.Int64(duration.Nanoseconds()))
 		r.span.SetAttributes(dnsDurationKey.Int64(duration.Nanoseconds()))
@@ -242,9 +274,52 @@ func (r *traceRecorder) markDNSDone(info httptrace.DNSDoneInfo) {
 	r.span.AddEvent("httptrace.dns", trace.WithTimestamp(now), trace.WithAttributes(attrs...))
 }
 
+func (r *traceRecorder) popDNSStart() int64 {
+	r.mu.Lock()
+	if len(r.dnsStarts) == 0 {
+		r.mu.Unlock()
+		return 0
+	}
+	startNS := r.dnsStarts[0]
+	copy(r.dnsStarts, r.dnsStarts[1:])
+	r.dnsStarts = r.dnsStarts[:len(r.dnsStarts)-1]
+	r.mu.Unlock()
+	return startNS
+}
+
+func (r *traceRecorder) markGetConnStart(hostPort string) {
+	now := r.now()
+	r.mu.Lock()
+	r.getConn = append(r.getConn, now.UnixNano())
+	r.mu.Unlock()
+
+	r.span.AddEvent("httptrace.get_conn_start",
+		trace.WithTimestamp(now),
+		trace.WithAttributes(serverAddressAttributes(hostPort)...),
+	)
+}
+
+func (r *traceRecorder) popGetConnStart() int64 {
+	r.mu.Lock()
+	if len(r.getConn) == 0 {
+		r.mu.Unlock()
+		return 0
+	}
+	startNS := r.getConn[0]
+	copy(r.getConn, r.getConn[1:])
+	r.getConn = r.getConn[:len(r.getConn)-1]
+	r.mu.Unlock()
+	return startNS
+}
+
 func (r *traceRecorder) markConnectStart(network, addr string) {
-	now := time.Now()
-	r.connectStartNS.Store(now.UnixNano())
+	now := r.now()
+	r.mu.Lock()
+	if r.connectMap == nil {
+		r.connectMap = make(map[string]int64)
+	}
+	r.connectMap[connectKey(network, addr)] = now.UnixNano()
+	r.mu.Unlock()
 
 	attrs := make([]attribute.KeyValue, 0, 3)
 	attrs = append(attrs, attribute.String("network.transport", network))
@@ -257,13 +332,13 @@ func (r *traceRecorder) markConnectStart(network, addr string) {
 }
 
 func (r *traceRecorder) markConnectDone(network, addr string, err error) {
-	now := time.Now()
+	now := r.now()
 	attrs := []attribute.KeyValue{
 		attribute.String("network.transport", network),
 	}
 	attrs = append(attrs, networkPeerAttributes(addr)...)
 
-	if startNS := r.connectStartNS.Load(); startNS != 0 {
+	if startNS := r.popConnectStart(network, addr); startNS != 0 {
 		duration := now.Sub(time.Unix(0, startNS))
 		attrs = append(attrs, connectDurationKey.Int64(duration.Nanoseconds()))
 		r.span.SetAttributes(connectDurationKey.Int64(duration.Nanoseconds()))
@@ -277,8 +352,25 @@ func (r *traceRecorder) markConnectDone(network, addr string, err error) {
 	r.span.AddEvent("httptrace.connect", trace.WithTimestamp(now), trace.WithAttributes(attrs...))
 }
 
+func (r *traceRecorder) popConnectStart(network, addr string) int64 {
+	r.mu.Lock()
+	if r.connectMap == nil {
+		r.mu.Unlock()
+		return 0
+	}
+	key := connectKey(network, addr)
+	startNS := r.connectMap[key]
+	delete(r.connectMap, key)
+	r.mu.Unlock()
+	return startNS
+}
+
+func connectKey(network, addr string) string {
+	return network + "\x00" + addr
+}
+
 func (r *traceRecorder) markTLSStart() {
-	now := time.Now()
+	now := r.now()
 	r.tlsStartNS.Store(now.UnixNano())
 
 	r.span.AddEvent("httptrace.tls_handshake_start", trace.WithTimestamp(now))
@@ -286,7 +378,7 @@ func (r *traceRecorder) markTLSStart() {
 
 func (r *traceRecorder) markTLSDone(state tls.ConnectionState, err error) {
 	var attrs []attribute.KeyValue
-	now := time.Now()
+	now := r.now()
 
 	if startNS := r.tlsStartNS.Load(); startNS != 0 {
 		duration := now.Sub(time.Unix(0, startNS))
@@ -307,10 +399,15 @@ func (r *traceRecorder) markTLSDone(state tls.ConnectionState, err error) {
 }
 
 func (r *traceRecorder) markGotConn(info httptrace.GotConnInfo) {
-	now := time.Now()
+	now := r.now()
 	attrs := []attribute.KeyValue{
 		connectionReusedKey.Bool(info.Reused),
 		connectionWasIdleKey.Bool(info.WasIdle),
+	}
+
+	if startNS := r.popGetConnStart(); startNS != 0 {
+		duration := now.Sub(time.Unix(0, startNS))
+		attrs = append(attrs, getConnDurationKey.Int64(duration.Nanoseconds()))
 	}
 
 	if info.IdleTime > 0 {
@@ -325,9 +422,29 @@ func (r *traceRecorder) markGotConn(info httptrace.GotConnInfo) {
 	r.span.AddEvent("httptrace.got_conn", trace.WithTimestamp(now), trace.WithAttributes(attrs...))
 }
 
+func (r *traceRecorder) markWroteHeaders() {
+	r.span.AddEvent("httptrace.wrote_headers", trace.WithTimestamp(r.now()))
+}
+
+func (r *traceRecorder) markWait100Continue() {
+	r.span.AddEvent("httptrace.wait_100_continue", trace.WithTimestamp(r.now()))
+}
+
+func (r *traceRecorder) markGot100Continue() {
+	r.span.AddEvent("httptrace.got_100_continue", trace.WithTimestamp(r.now()))
+}
+
+func (r *traceRecorder) markGot1xxResponse(code int, _ textproto.MIMEHeader) error {
+	r.span.AddEvent("httptrace.got_1xx_response",
+		trace.WithTimestamp(r.now()),
+		trace.WithAttributes(attribute.Int("http.response.status_code", code)),
+	)
+	return nil
+}
+
 func (r *traceRecorder) markWroteRequest(err error) {
 	var attrs []attribute.KeyValue
-	now := time.Now()
+	now := r.now()
 
 	if err != nil {
 		attrs = append(attrs, attribute.String("error.type", fmt.Sprintf("%T", err)))
@@ -338,7 +455,7 @@ func (r *traceRecorder) markWroteRequest(err error) {
 }
 
 func (r *traceRecorder) markGotFirstResponseByte() {
-	now := time.Now()
+	now := r.now()
 	duration := now.Sub(time.Unix(0, r.startNS))
 
 	attr := timeToFirstByteKey.Int64(duration.Nanoseconds())
@@ -348,7 +465,7 @@ func (r *traceRecorder) markGotFirstResponseByte() {
 
 func (r *traceRecorder) markPutIdleConn(err error) {
 	var attrs []attribute.KeyValue
-	now := time.Now()
+	now := r.now()
 
 	if err != nil {
 		attrs = append(attrs, attribute.String("error.type", fmt.Sprintf("%T", err)))
@@ -405,7 +522,7 @@ func requestAttributes(req *http.Request, extra []attribute.KeyValue) []attribut
 	attrs = append(attrs, extra...)
 	attrs = append(attrs,
 		attribute.String("http.request.method", req.Method),
-		attribute.String("url.full", req.URL.String()),
+		attribute.String("url.full", redactedURLString(req.URL)),
 		attribute.String("url.scheme", req.URL.Scheme),
 	)
 
@@ -418,6 +535,13 @@ func requestAttributes(req *http.Request, extra []attribute.KeyValue) []attribut
 	}
 
 	return attrs
+}
+
+func redactedURLString(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return u.Redacted()
 }
 
 func requestPort(req *http.Request) int {
@@ -462,21 +586,27 @@ func explicitPort(host string) (string, bool) {
 }
 
 func networkPeerAttributes(addr string) []attribute.KeyValue {
-	host, port, err := net.SplitHostPort(addr)
+	return hostPortAttributes(addr, "network.peer.address", "network.peer.port")
+}
+
+func serverAddressAttributes(hostPort string) []attribute.KeyValue {
+	return hostPortAttributes(hostPort, "server.address", "server.port")
+}
+
+func hostPortAttributes(hostPort string, addressKey, portKey attribute.Key) []attribute.KeyValue {
+	host, port, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return []attribute.KeyValue{
-			attribute.String("network.peer.address", addr),
+			addressKey.String(hostPort),
 		}
 	}
 
 	attrs := []attribute.KeyValue{
-		attribute.String("network.peer.address", host),
+		addressKey.String(host),
 	}
-
 	if n, err := strconv.Atoi(port); err == nil {
-		attrs = append(attrs, attribute.Int("network.peer.port", n))
+		attrs = append(attrs, portKey.Int(n))
 	}
-
 	return attrs
 }
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -201,6 +202,45 @@ func (s *recordingSpan) eventAttrs(name string) map[string]any {
 	return nil
 }
 
+func (s *recordingSpan) eventsByName(name string) []recordingEvent {
+	s.mu.Lock()
+	var out []recordingEvent
+	for _, event := range s.events {
+		if event.name == name {
+			out = append(out, recordingEvent{
+				name:       event.name,
+				attrs:      append([]attribute.KeyValue(nil), event.attrs...),
+				stackTrace: event.stackTrace,
+			})
+		}
+	}
+	s.mu.Unlock()
+	return out
+}
+
+func steppedClock(start time.Time, steps ...time.Duration) func() time.Time {
+	times := make([]time.Time, 0, len(steps)+1)
+	times = append(times, start)
+	for _, step := range steps {
+		times = append(times, start.Add(step))
+	}
+
+	var mu sync.Mutex
+	var i int
+	return func() time.Time {
+		mu.Lock()
+		if i >= len(times) {
+			next := times[len(times)-1]
+			mu.Unlock()
+			return next
+		}
+		next := times[i]
+		i++
+		mu.Unlock()
+		return next
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -285,4 +325,16 @@ func assertAttr(t *testing.T, attrs map[string]any, key string, want any) {
 	if got, ok := attrs[key]; !ok || got != want {
 		t.Fatalf("attribute %q = %v, %t; want %v", key, got, ok, want)
 	}
+}
+
+func assertEventCount(t *testing.T, span *recordingSpan, name string, want int) {
+	t.Helper()
+
+	if got := len(span.eventsByName(name)); got != want {
+		t.Fatalf("events %q = %d, want %d", name, got, want)
+	}
+}
+
+func connectTestAddr(i int) string {
+	return net.JoinHostPort("127.0.1."+strconv.Itoa(i+1), "443")
 }
