@@ -1,81 +1,80 @@
 # otelhttptrace
 
-OpenTelemetry instrumentation for outgoing `net/http` requests with
-`net/http/httptrace` phase timings.
+OpenTelemetry instrumentation for outgoing `net/http` requests. Records DNS,
+connection acquisition, TCP connect, TLS handshake, connection reuse, request
+write, and time-to-first-byte data using `net/http/httptrace`.
 
-The package can work in two modes:
-
-- standalone: wrap an `http.RoundTripper`, start a client span for each request,
-  and record DNS, TCP connect, TLS handshake, connection reuse, request write,
-  and time-to-first-byte data as span events and attributes;
-- with `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`: record
-  the same `httptrace` data on the span created by `otelhttp`.
+Requires Go 1.26 or later.
 
 ## Usage
 
-```go
-client := &http.Client{
-    Transport: otelhttptrace.NewTransport(http.DefaultTransport, otelhttptrace.Config{}),
-}
-
-resp, err := client.Get("https://example.com")
-if err != nil {
-    return err
-}
-defer resp.Body.Close()
-```
-
-Use `Config` to provide a non-global tracer provider, add default attributes,
-or customize span names:
+Import `github.com/skarm/otelhttptrace` and wrap the client's transport:
 
 ```go
 client := &http.Client{
-    Transport: otelhttptrace.NewTransport(
-        nil,
-        otelhttptrace.Config{
-            TracerProvider: provider,
-            Attributes: []attribute.KeyValue{
-                attribute.String("service.component", "api-client"),
-            },
-            SpanNameFormatter: func(req *http.Request) string {
-                return req.Method + " " + req.URL.Hostname()
-            },
-        },
-    ),
+	Transport: otelhttptrace.NewTransport(http.DefaultTransport, otelhttptrace.Config{}),
 }
 ```
 
-Spans end when the response body is closed. This keeps the span duration aligned
-with the full response consumption instead of only the header round trip.
+The zero-value `Config` uses the global OpenTelemetry tracer provider and
+propagator. Configure them in your application, or set `Config.TracerProvider`
+and `Config.Propagators` explicitly. `Config.Attributes` adds span attributes;
+`Config.SpanNameFormatter` overrides the default `METHOD host` name. A nil base
+transport uses `http.DefaultTransport`.
+
+Each request creates a client span. Always close the response body to finish
+the span; reading to EOF alone does not finish it. Transport errors and
+responses without a body finish the span immediately.
 
 ## Usage with otelhttp
 
-The preferred integration is to let `otelhttp` own the HTTP client span and pass
-this package's client trace factory to `otelhttp.WithClientTrace`:
+With `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, use
+`WithClientTrace` to record phase data on its HTTP client span:
 
 ```go
 client := &http.Client{
-    Transport: otelhttp.NewTransport(
-        http.DefaultTransport,
-        otelhttp.WithClientTrace(otelhttptrace.NewClientTrace),
-    ),
+	Transport: otelhttp.NewTransport(
+		http.DefaultTransport,
+		otelhttp.WithClientTrace(otelhttptrace.NewClientTrace),
+	),
 }
 ```
 
-If you need this package to sit in the `RoundTripper` chain, set
-`Config.SpanFromContext` and make it the base transport for `otelhttp`:
+Alternatively, pass `otelhttptrace.NewTransport` with
+`otelhttptrace.Config{SpanFromContext: true}` as the base transport to
+`otelhttp.NewTransport`. In both cases, `otelhttp` creates and ends the span
+and handles propagation.
 
-```go
-client := &http.Client{
-    Transport: otelhttp.NewTransport(
-        otelhttptrace.NewTransport(
-            http.DefaultTransport,
-            otelhttptrace.Config{SpanFromContext: true},
-        ),
-    ),
-}
+## Telemetry
+
+Standard attribute keys come from `go.opentelemetry.io/otel/semconv/v1.43.0`.
+Phase events and timing attributes under `httptrace.*` are package extensions;
+durations use nanoseconds. Ambiguous overlapping phases retain their events
+but omit durations.
+
+Standalone spans mark HTTP 4xx/5xx responses and terminal transport or body
+errors as `Error`. Explicit request cancellation alone does not set `Error`;
+errors that also include a timeout do. Phase failures are diagnostic and may
+be followed by a successful request.
+
+`url.full` omits userinfo and fragments and redacts known credential query
+parameters, such as `access_token`, `api_key`, and `X-Amz-Signature`. Other query
+values remain visible. Redaction affects telemetry only; the request URL is
+unchanged.
+
+## Tests and benchmarks
+
+The root package and SDK/`otelhttp` integration tests in `tests/` are separate
+Go modules. Run tests in both:
+
+```sh
+go test -race ./...
+(cd tests && go test -race ./...)
 ```
 
-In this mode `otelhttptrace` does not create or end a span. It only records
-`httptrace` events and timing attributes on the span already active in the
-request context.
+Run benchmarks:
+
+```sh
+go test -run '^$' -bench . -benchmem
+(cd tests && go test -run '^$' -bench . -benchmem)
+```

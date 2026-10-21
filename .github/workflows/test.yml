@@ -1,0 +1,74 @@
+---
+name: Test
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }} / ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [minimum, stable]
+        module: ['.', tests]
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.module }}
+    steps:
+      - name: Checkout
+        # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        # v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          # An explicit version takes precedence over go-version-file.
+          go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: Go version
+        run: go version
+
+      - name: Check formatting
+        if: matrix.go == 'stable' && matrix.module == '.'
+        run: |
+          files=$(gofmt -l .)
+          if [[ -n "$files" ]]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Check modules
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race tests
+        run: go test -race -shuffle=on -count=25 -timeout=5m ./...
+
+      - name: Smoke-test benchmarks
+        run: go test -run '^$' -bench . -benchtime=1x -timeout=2m ./...

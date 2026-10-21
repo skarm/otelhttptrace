@@ -2,10 +2,19 @@ package otelhttptrace
 
 import (
 	"net/http"
+	"net/url"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
 )
+
+func TestDefaultSpanNameFallsBackToURLHost(t *testing.T) {
+	req := &http.Request{Method: http.MethodGet, URL: &url.URL{Scheme: "http", Host: "example.com:bad"}}
+
+	if got := defaultSpanName(req); got != "GET example.com:bad" {
+		t.Fatalf("default span name = %q, want %q", got, "GET example.com:bad")
+	}
+}
 
 func TestConfigResolveAppliesDefaultsAndCopiesAttributes(t *testing.T) {
 	attrs := []attribute.KeyValue{attribute.String("component", "unit")}
@@ -13,6 +22,9 @@ func TestConfigResolveAppliesDefaultsAndCopiesAttributes(t *testing.T) {
 
 	if cfg.TracerProvider == nil {
 		t.Fatal("resolved tracer provider is nil")
+	}
+	if cfg.Propagators == nil {
+		t.Fatal("resolved propagators are nil")
 	}
 	if cfg.SpanNameFormatter == nil {
 		t.Fatal("resolved span name formatter is nil")

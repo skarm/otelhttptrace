@@ -84,6 +84,7 @@ type recordingSpan struct {
 	statusCode     codes.Code
 	statusDesc     string
 	ended          bool
+	endCount       int
 }
 
 type recordingEvent struct {
@@ -104,6 +105,7 @@ func (s *recordingSpan) End(...trace.SpanEndOption) {
 	defer s.mu.Unlock()
 
 	s.ended = true
+	s.endCount++
 }
 
 func (s *recordingSpan) AddEvent(name string, opts ...trace.EventOption) {
@@ -111,6 +113,9 @@ func (s *recordingSpan) AddEvent(name string, opts ...trace.EventOption) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
 
 	s.events = append(s.events, recordingEvent{
 		name:       name,
@@ -120,7 +125,9 @@ func (s *recordingSpan) AddEvent(name string, opts ...trace.EventOption) {
 }
 
 func (s *recordingSpan) IsRecording() bool {
-	return true
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.ended
 }
 
 func (s *recordingSpan) RecordError(err error, opts ...trace.EventOption) {
@@ -131,6 +138,9 @@ func (s *recordingSpan) RecordError(err error, opts ...trace.EventOption) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
 
 	s.recordedErrors = append(s.recordedErrors, err)
 	s.events = append(s.events, recordingEvent{
@@ -143,14 +153,23 @@ func (s *recordingSpan) RecordError(err error, opts ...trace.EventOption) {
 func (s *recordingSpan) SetStatus(code codes.Code, description string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ended || s.statusCode > code {
+		return
+	}
 
 	s.statusCode = code
-	s.statusDesc = description
+	s.statusDesc = ""
+	if code == codes.Error {
+		s.statusDesc = description
+	}
 }
 
 func (s *recordingSpan) SetName(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
 
 	s.name = name
 }
@@ -158,6 +177,9 @@ func (s *recordingSpan) SetName(name string) {
 func (s *recordingSpan) SetAttributes(kv ...attribute.KeyValue) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
 
 	for _, next := range kv {
 		replaced := false

@@ -5,6 +5,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -19,6 +20,11 @@ type Config struct {
 	// TracerProvider creates standalone client spans.
 	// If nil, the global OpenTelemetry tracer provider is used.
 	TracerProvider trace.TracerProvider
+
+	// Propagators injects the standalone span context into a private copy of
+	// the request headers, including for non-recording spans. If nil, the
+	// global OpenTelemetry propagator is used. Ignored in SpanFromContext mode.
+	Propagators propagation.TextMapPropagator
 
 	// Attributes are added to every standalone client span.
 	Attributes []attribute.KeyValue
@@ -42,6 +48,9 @@ func (c Config) Resolve() Config {
 	if c.TracerProvider == nil {
 		c.TracerProvider = otel.GetTracerProvider()
 	}
+	if c.Propagators == nil {
+		c.Propagators = otel.GetTextMapPropagator()
+	}
 	if c.SpanNameFormatter == nil {
 		c.SpanNameFormatter = defaultSpanName
 	}
@@ -56,5 +65,12 @@ func defaultSpanName(req *http.Request) string {
 	if host == "" {
 		host = req.URL.Host
 	}
-	return req.Method + " " + host
+	return requestMethod(req) + " " + host
+}
+
+func requestMethod(req *http.Request) string {
+	if req.Method == "" {
+		return http.MethodGet
+	}
+	return req.Method
 }

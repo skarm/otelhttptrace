@@ -12,6 +12,10 @@ import (
 
 type benchmarkRoundTripper struct{}
 
+// A distinct provider type keeps the sampler-attribute path enabled. An exact
+// noop.TracerProvider intentionally bypasses requestAttributes in Transport.
+type benchmarkPortProvider struct{ noop.TracerProvider }
+
 type benchmarkPortCase struct {
 	name string
 	req  *http.Request
@@ -37,7 +41,7 @@ func BenchmarkRoundTripperBaseline(b *testing.B) {
 func BenchmarkTransportRoundTripPortAttributes(b *testing.B) {
 	benchmarkPortRoundTrips(b, func() http.RoundTripper {
 		return otelhttptrace.NewTransport(benchmarkRoundTripper{}, otelhttptrace.Config{
-			TracerProvider: noop.NewTracerProvider(),
+			TracerProvider: benchmarkPortProvider{noop.NewTracerProvider()},
 		})
 	})
 }
